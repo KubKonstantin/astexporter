@@ -39,6 +39,7 @@ EXPORTER_PORT = int(os.getenv("EXPORTER_PORT", "9631"))
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "15"))
 ASTERISK_BIN = os.getenv("ASTERISK_BIN", "asterisk")
+ENABLE_CLI = os.getenv("ENABLE_CLI", "false").lower() == "true"
 COMMAND_TIMEOUT = float(os.getenv("COMMAND_TIMEOUT", "8"))
 CLI_REQUIRED = os.getenv("CLI_REQUIRED", "false").lower() == "true"
 
@@ -106,6 +107,7 @@ call_duration = Histogram(
 )
 
 active_channels: Dict[str, float] = {}
+active_bridges: Set[str] = set()
 queue_stats_cache: Dict[str, int] = {}
 cli_available = True
 cli_error_logged = False
@@ -160,6 +162,9 @@ async def run_asterisk_cmd(command: str) -> str:
     if not cli_available:
         raise RuntimeError("asterisk CLI unavailable")
 
+    if not ENABLE_CLI:
+        raise RuntimeError("CLI collection is disabled (ENABLE_CLI=false)")
+
     if shutil.which(ASTERISK_BIN) is None:
         cli_available = False
         asterisk_cli_up.set(0)
@@ -167,15 +172,14 @@ async def run_asterisk_cmd(command: str) -> str:
         if not cli_error_logged:
             logger.error(
                 "Asterisk CLI binary '%s' not found in PATH. "
-                "Set ASTERISK_BIN to full path or include it in PATH.",
+                "For containerized setup prefer AMI metrics; only enable CLI when binary is available in astexporter container.",
                 ASTERISK_BIN,
             )
             cli_error_logged = True
         raise RuntimeError(f"{ASTERISK_BIN} not found")
+    cmd = [ASTERISK_BIN, "-rx", command]
 
-    proc = await asyncio.create_subprocess_exec(
-        ASTERISK_BIN, "-rx", command, stdout=PIPE, stderr=PIPE
-    )
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=COMMAND_TIMEOUT)
     except asyncio.TimeoutError:
@@ -191,7 +195,7 @@ async def run_asterisk_cmd(command: str) -> str:
             update_asterisk_up()
             if not cli_error_logged:
                 logger.error(
-                    "Asterisk CLI command failed because binary was not found: %s",
+                    "Asterisk CLI command failed because executable/container was not found: %s",
                     err,
                 )
                 cli_error_logged = True
@@ -294,6 +298,7 @@ async def on_new_channel(_manager, event):
     uniqueid = event.get("Uniqueid")
     if uniqueid:
         active_channels[uniqueid] = time.time()
+        asterisk_active_channels.set(len(active_channels))
 
 
 @manager.register_event("Hangup")
@@ -302,6 +307,7 @@ async def on_hangup(_manager, event):
     if uniqueid and uniqueid in active_channels:
         duration = time.time() - active_channels.pop(uniqueid)
         call_duration.observe(duration)
+    asterisk_active_channels.set(len(active_channels))
 
 
 @manager.register_event("DialEnd")
@@ -310,6 +316,22 @@ async def on_dial_end(_manager, event):
         calls_answered_total.inc()
     else:
         calls_failed_total.inc()
+
+
+@manager.register_event("BridgeEnter")
+async def on_bridge_enter(_manager, event):
+    bridge_id = event.get("BridgeUniqueid")
+    if bridge_id:
+        active_bridges.add(bridge_id)
+        asterisk_active_calls.set(len(active_bridges))
+
+
+@manager.register_event("BridgeLeave")
+async def on_bridge_leave(_manager, event):
+    bridge_id = event.get("BridgeUniqueid")
+    if bridge_id and bridge_id in active_bridges:
+        active_bridges.discard(bridge_id)
+    asterisk_active_calls.set(len(active_bridges))
 
 
 @manager.register_event("QueueCallerJoin")
@@ -384,17 +406,23 @@ async def main() -> None:
     site = web.TCPSite(runner, EXPORTER_HOST, EXPORTER_PORT)
     await site.start()
 
-    tasks = [
-        asyncio.create_task(collect_core()),
-        asyncio.create_task(collect_taskprocessors()),
-        asyncio.create_task(collect_pjsip()),
-        asyncio.create_task(collect_queues()),
-    ]
+    tasks = []
+    if ENABLE_CLI:
+        tasks.extend(
+            [
+                asyncio.create_task(collect_core()),
+                asyncio.create_task(collect_taskprocessors()),
+                asyncio.create_task(collect_pjsip()),
+                asyncio.create_task(collect_queues()),
+            ]
+        )
+    else:
+        logger.info("CLI collectors are disabled (ENABLE_CLI=false). Using AMI-first metrics mode.")
 
     await manager.connect()
     asterisk_ami_up.set(1)
     update_asterisk_up()
-    if shutil.which(ASTERISK_BIN) is None:
+    if ENABLE_CLI and shutil.which(ASTERISK_BIN) is None:
         logger.warning("Starting without CLI collectors: ASTERISK_BIN=%s not found", ASTERISK_BIN)
     logger.info("Exporter started on %s:%s", EXPORTER_HOST, EXPORTER_PORT)
 
