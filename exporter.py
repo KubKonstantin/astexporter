@@ -50,7 +50,9 @@ logger = logging.getLogger("astexporter")
 
 registry = CollectorRegistry()
 
-asterisk_up = Gauge("asterisk_up", "Asterisk availability", registry=registry)
+asterisk_up = Gauge("asterisk_up", "Asterisk availability (AMI or CLI)", registry=registry)
+asterisk_ami_up = Gauge("asterisk_ami_up", "AMI connection availability", registry=registry)
+asterisk_cli_up = Gauge("asterisk_cli_up", "Asterisk CLI availability", registry=registry)
 asterisk_uptime_seconds = Gauge(
     "asterisk_uptime_seconds", "Asterisk uptime seconds", registry=registry
 )
@@ -107,6 +109,11 @@ active_channels: Dict[str, float] = {}
 queue_stats_cache: Dict[str, int] = {}
 cli_available = True
 cli_error_logged = False
+for g in (asterisk_uptime_seconds, asterisk_active_channels, asterisk_active_calls):
+    g.set(float("nan"))
+asterisk_ami_up.set(0)
+asterisk_cli_up.set(0)
+update_asterisk_up()
 
 TASKPROCESSOR_REGEX = re.compile(
     r"^(?P<name>\S+)\s+(?P<processed>\d+)\s+(?P<inqueue>\d+)\s+(?P<maxdepth>\d+)"
@@ -122,6 +129,27 @@ MEMBER_REGEX = re.compile(r"Members:\s+(?P<count>\d+)")
 HOLDTIME_REGEX = re.compile(r"holdtime\s+(?P<holdtime>\d+)")
 
 
+
+
+def update_asterisk_up() -> None:
+    asterisk_up.set(1 if (asterisk_ami_up._value.get() > 0 or asterisk_cli_up._value.get() > 0) else 0)
+
+
+def parse_uptime_seconds(output: str) -> int | None:
+    match = UPTIME_REGEX.search(output)
+    if match:
+        return int(match.group("seconds"))
+
+    text = output.lower()
+    units = {"week": 604800, "day": 86400, "hour": 3600, "minute": 60, "second": 1}
+    total = 0
+    found = False
+    for unit, mult in units.items():
+        m = re.search(rf"(\d+)\s+{unit}s?", text)
+        if m:
+            total += int(m.group(1)) * mult
+            found = True
+    return total if found else None
 async def run_asterisk_cmd(command: str) -> str:
     global cli_available, cli_error_logged
 
@@ -130,7 +158,8 @@ async def run_asterisk_cmd(command: str) -> str:
 
     if shutil.which(ASTERISK_BIN) is None:
         cli_available = False
-        asterisk_up.set(0)
+        asterisk_cli_up.set(0)
+        update_asterisk_up()
         if not cli_error_logged:
             logger.error(
                 "Asterisk CLI binary '%s' not found in PATH. "
@@ -154,7 +183,8 @@ async def run_asterisk_cmd(command: str) -> str:
         err = stderr.decode(errors="replace").strip()
         if "not found" in err.lower():
             cli_available = False
-            asterisk_up.set(0)
+            asterisk_cli_up.set(0)
+            update_asterisk_up()
             if not cli_error_logged:
                 logger.error(
                     "Asterisk CLI command failed because binary was not found: %s",
@@ -191,9 +221,9 @@ async def collect_core() -> None:
     while True:
         try:
             uptime_output = await run_asterisk_cmd("core show uptime seconds")
-            uptime_match = UPTIME_REGEX.search(uptime_output)
-            if uptime_match:
-                asterisk_uptime_seconds.set(int(uptime_match.group("seconds")))
+            uptime_seconds = parse_uptime_seconds(uptime_output)
+            if uptime_seconds is not None:
+                asterisk_uptime_seconds.set(uptime_seconds)
             else:
                 logger.warning("unable to parse uptime from output: %s", uptime_output.strip())
 
@@ -206,13 +236,15 @@ async def collect_core() -> None:
             if calls_match:
                 asterisk_active_calls.set(int(calls_match.group("calls")))
 
-            asterisk_up.set(1)
+            asterisk_cli_up.set(1)
+            update_asterisk_up()
         except Exception as exc:
             if cli_available or CLI_REQUIRED:
                 logger.exception("core collector error")
             else:
                 logger.debug("core collector skipped: %s", exc)
-            asterisk_up.set(0)
+            asterisk_cli_up.set(0)
+        update_asterisk_up()
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -356,6 +388,8 @@ async def main() -> None:
     ]
 
     await manager.connect()
+    asterisk_ami_up.set(1)
+    update_asterisk_up()
     if shutil.which(ASTERISK_BIN) is None:
         logger.warning("Starting without CLI collectors: ASTERISK_BIN=%s not found", ASTERISK_BIN)
     logger.info("Exporter started on %s:%s", EXPORTER_HOST, EXPORTER_PORT)
