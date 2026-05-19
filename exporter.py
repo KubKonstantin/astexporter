@@ -113,7 +113,6 @@ for g in (asterisk_uptime_seconds, asterisk_active_channels, asterisk_active_cal
     g.set(float("nan"))
 asterisk_ami_up.set(0)
 asterisk_cli_up.set(0)
-update_asterisk_up()
 
 TASKPROCESSOR_REGEX = re.compile(
     r"^(?P<name>\S+)\s+(?P<processed>\d+)\s+(?P<inqueue>\d+)\s+(?P<maxdepth>\d+)"
@@ -150,6 +149,11 @@ def parse_uptime_seconds(output: str) -> int | None:
             total += int(m.group(1)) * mult
             found = True
     return total if found else None
+
+
+update_asterisk_up()
+
+
 async def run_asterisk_cmd(command: str) -> str:
     global cli_available, cli_error_logged
 
