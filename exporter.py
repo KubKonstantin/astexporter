@@ -2,14 +2,13 @@ import asyncio
 import logging
 import os
 import re
-import shlex
+import shutil
 import signal
 import time
 from asyncio.subprocess import PIPE
 from contextlib import suppress
 from typing import Dict, Set
 
-import uvloop
 from aiohttp import web
 from panoramisk import Manager
 from prometheus_client import (
@@ -22,7 +21,13 @@ from prometheus_client import (
 )
 
 
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+try:
+    import uvloop
+except ImportError:
+    uvloop = None
+
+if uvloop is not None:
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 AMI_HOST = os.getenv("AMI_HOST", "127.0.0.1")
 AMI_PORT = int(os.getenv("AMI_PORT", "5038"))
@@ -35,6 +40,7 @@ EXPORTER_PORT = int(os.getenv("EXPORTER_PORT", "9631"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "15"))
 ASTERISK_BIN = os.getenv("ASTERISK_BIN", "asterisk")
 COMMAND_TIMEOUT = float(os.getenv("COMMAND_TIMEOUT", "8"))
+CLI_REQUIRED = os.getenv("CLI_REQUIRED", "false").lower() == "true"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -99,6 +105,8 @@ call_duration = Histogram(
 
 active_channels: Dict[str, float] = {}
 queue_stats_cache: Dict[str, int] = {}
+cli_available = True
+cli_error_logged = False
 
 TASKPROCESSOR_REGEX = re.compile(
     r"^(?P<name>\S+)\s+(?P<processed>\d+)\s+(?P<inqueue>\d+)\s+(?P<maxdepth>\d+)"
@@ -115,8 +123,26 @@ HOLDTIME_REGEX = re.compile(r"holdtime\s+(?P<holdtime>\d+)")
 
 
 async def run_asterisk_cmd(command: str) -> str:
-    full_cmd = f"{shlex.quote(ASTERISK_BIN)} -rx {shlex.quote(command)}"
-    proc = await asyncio.create_subprocess_shell(full_cmd, stdout=PIPE, stderr=PIPE)
+    global cli_available, cli_error_logged
+
+    if not cli_available:
+        raise RuntimeError("asterisk CLI unavailable")
+
+    if shutil.which(ASTERISK_BIN) is None:
+        cli_available = False
+        asterisk_up.set(0)
+        if not cli_error_logged:
+            logger.error(
+                "Asterisk CLI binary '%s' not found in PATH. "
+                "Set ASTERISK_BIN to full path or include it in PATH.",
+                ASTERISK_BIN,
+            )
+            cli_error_logged = True
+        raise RuntimeError(f"{ASTERISK_BIN} not found")
+
+    proc = await asyncio.create_subprocess_exec(
+        ASTERISK_BIN, "-rx", command, stdout=PIPE, stderr=PIPE
+    )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=COMMAND_TIMEOUT)
     except asyncio.TimeoutError:
@@ -125,7 +151,17 @@ async def run_asterisk_cmd(command: str) -> str:
         raise RuntimeError(f"timeout running: {command}")
 
     if proc.returncode != 0:
-        raise RuntimeError(f"{command} failed: {stderr.decode().strip()}")
+        err = stderr.decode(errors="replace").strip()
+        if "not found" in err.lower():
+            cli_available = False
+            asterisk_up.set(0)
+            if not cli_error_logged:
+                logger.error(
+                    "Asterisk CLI command failed because binary was not found: %s",
+                    err,
+                )
+                cli_error_logged = True
+        raise RuntimeError(f"{command} failed: {err}")
     return stdout.decode(errors="replace")
 
 
@@ -143,8 +179,11 @@ async def collect_taskprocessors() -> None:
                 taskprocessor_queue_depth.labels(name=name).set(int(match.group("inqueue")))
                 taskprocessor_processed.labels(name=name).set(int(match.group("processed")))
                 taskprocessor_high_water.labels(name=name).set(int(match.group("maxdepth")))
-        except Exception:
-            logger.exception("taskprocessor collector error")
+        except Exception as exc:
+            if cli_available or CLI_REQUIRED:
+                logger.exception("taskprocessor collector error")
+            else:
+                logger.debug("taskprocessor collector skipped: %s", exc)
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -168,8 +207,11 @@ async def collect_core() -> None:
                 asterisk_active_calls.set(int(calls_match.group("calls")))
 
             asterisk_up.set(1)
-        except Exception:
-            logger.exception("core collector error")
+        except Exception as exc:
+            if cli_available or CLI_REQUIRED:
+                logger.exception("core collector error")
+            else:
+                logger.debug("core collector skipped: %s", exc)
             asterisk_up.set(0)
         await asyncio.sleep(POLL_INTERVAL)
 
@@ -200,8 +242,11 @@ async def collect_pjsip() -> None:
                 match = REGISTRATION_OK_REGEX.search(line.strip())
                 if match:
                     pjsip_registration_status.labels(registration=match.group("name")).set(1)
-        except Exception:
-            logger.exception("pjsip collector error")
+        except Exception as exc:
+            if cli_available or CLI_REQUIRED:
+                logger.exception("pjsip collector error")
+            else:
+                logger.debug("pjsip collector skipped: %s", exc)
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -276,8 +321,11 @@ async def collect_queues() -> None:
                 holdtime_match = HOLDTIME_REGEX.search(line)
                 if holdtime_match and current_queue:
                     queue_holdtime.labels(queue=current_queue).set(int(holdtime_match.group("holdtime")))
-        except Exception:
-            logger.exception("queue collector error")
+        except Exception as exc:
+            if cli_available or CLI_REQUIRED:
+                logger.exception("queue collector error")
+            else:
+                logger.debug("queue collector skipped: %s", exc)
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -308,6 +356,8 @@ async def main() -> None:
     ]
 
     await manager.connect()
+    if shutil.which(ASTERISK_BIN) is None:
+        logger.warning("Starting without CLI collectors: ASTERISK_BIN=%s not found", ASTERISK_BIN)
     logger.info("Exporter started on %s:%s", EXPORTER_HOST, EXPORTER_PORT)
 
     stop_event = asyncio.Event()
