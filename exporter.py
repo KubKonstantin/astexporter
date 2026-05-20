@@ -130,7 +130,7 @@ CHANNELS_REGEX = re.compile(r"(?P<channels>\d+) active channels")
 CALLS_REGEX = re.compile(r"(?P<calls>\d+) active calls")
 ENDPOINT_REGEX = re.compile(r"Endpoint:\s+(?P<endpoint>[^\s(]+)")
 ENDPOINT_STATUS_INLINE_REGEX = re.compile(
-    r"\bAvail(?:able)?[:\s]+(?P<status>[A-Za-z]+)|\b(?P<state>Unavailable|Unknown|Reachable|NonQual)\b",
+    r"\bAvail(?:able)?[:\s]+(?P<status>[A-Za-z]+)|\b(?P<state>Unavailable|Unknown|Reachable|NonQual|In use|Not in use|Avail)\b",
     re.IGNORECASE,
 )
 CONTACT_REGEX = re.compile(
@@ -138,6 +138,10 @@ CONTACT_REGEX = re.compile(
     re.IGNORECASE,
 )
 RTT_REGEX = re.compile(r"\bRTT[:\s]+(?P<rtt>[\d\.]+)", re.IGNORECASE)
+CONTACT_STATUS_RTT_TAIL_REGEX = re.compile(
+    r"Contact:\s+.*\s(?P<status>Avail|Unavail|Unavailable|Reachable|Unknown|NonQual)\s+(?P<rtt>[\d\.]+)\s*$",
+    re.IGNORECASE,
+)
 REGISTRATION_OK_REGEX = re.compile(r"^(?P<name>\S+)\s+Registered\b")
 REGISTRATION_ANY_REGEX = re.compile(
     r"(?P<name>\S+)\s+(?P<state>Registered|Rejected|Unregistered|Request Sent|No Authentication|Failed|Timeout)",
@@ -164,7 +168,7 @@ def update_asterisk_up() -> None:
 
 def _pjsip_status_to_value(status: str) -> int:
     st = status.lower()
-    if st in {"avail", "available", "ok", "reachable", "lagged"}:
+    if st in {"avail", "available", "ok", "reachable", "lagged", "in use", "not in use"}:
         return 1
     return 0
 
@@ -450,6 +454,14 @@ async def collect_pjsip() -> None:
                     )
                     rtt_match = RTT_REGEX.search(line)
                     rtt = rtt_match.group("rtt") if rtt_match else None
+                    if rtt is None:
+                        tail_match = CONTACT_STATUS_RTT_TAIL_REGEX.search(line)
+                        if tail_match:
+                            status = tail_match.group("status")
+                            pjsip_endpoint_status.labels(endpoint=current_endpoint).set(
+                                _pjsip_status_to_value(status)
+                            )
+                            rtt = tail_match.group("rtt")
                     if rtt:
                         with suppress(ValueError):
                             pjsip_endpoint_rtt.labels(endpoint=current_endpoint).set(float(rtt))
