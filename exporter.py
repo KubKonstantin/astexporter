@@ -457,7 +457,10 @@ async def collect_taskprocessors() -> None:
             output = await run_asterisk_command("core show taskprocessors")
             seen: Set[str] = set()
             for line in output.splitlines():
-                match = TASKPROCESSOR_REGEX.search(line)
+                stripped = line.strip()
+                if not stripped or stripped.lower().startswith("processor "):
+                    continue
+                match = TASKPROCESSOR_REGEX.search(stripped)
                 if not match:
                     continue
                 name = match.group("name")
@@ -523,6 +526,9 @@ async def collect_pjsip() -> None:
                 endpoint_match = ENDPOINT_REGEX.search(line)
                 if endpoint_match:
                     current_endpoint = endpoint_match.group("endpoint")
+                    if current_endpoint.startswith("<"):
+                        current_endpoint = None
+                        continue
                     inline_match = ENDPOINT_STATUS_INLINE_REGEX.search(line)
                     if inline_match:
                         seen_endpoints.add(current_endpoint)
@@ -711,6 +717,8 @@ async def collect_queues() -> None:
                             snapshot_totals.setdefault(q, {})["abandoned"] = float(
                                 event.get("Abandoned", 0)
                             )
+            if not got_queue_events:
+                logger.debug("QueueStatus AMI returned no queue events; falling back to command parser")
             for q, count in member_counts.items():
                 queue_agents.labels(queue=q).set(count)
             for q, totals in snapshot_totals.items():
