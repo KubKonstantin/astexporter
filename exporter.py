@@ -213,10 +213,38 @@ async def run_asterisk_cmd_via_docker_socket(command: str) -> str:
                 raise RuntimeError(f"docker exec inspect failed ({resp.status}): {inspect_body}")
 
     exit_code = inspect_body.get("ExitCode")
-    decoded = raw_output.decode(errors="replace")
+    decoded = _decode_docker_exec_output(raw_output)
     if exit_code not in (0, None):
         raise RuntimeError(f"{command} failed in container '{CLI_DOCKER_CONTAINER}': {decoded.strip()}")
     return decoded
+
+
+def _decode_docker_exec_output(raw_output: bytes) -> str:
+    # Docker API may return multiplexed stream frames when TTY is disabled:
+    # 1 byte stream id, 3 bytes padding, 4 bytes big-endian payload length.
+    if len(raw_output) < 8:
+        return raw_output.decode(errors="replace")
+
+    out_chunks: list[bytes] = []
+    i = 0
+    parsed_any = False
+    total = len(raw_output)
+    while i + 8 <= total:
+        stream_type = raw_output[i]
+        if stream_type not in (0, 1, 2):
+            break
+        frame_len = int.from_bytes(raw_output[i + 4 : i + 8], byteorder="big")
+        frame_start = i + 8
+        frame_end = frame_start + frame_len
+        if frame_end > total:
+            break
+        out_chunks.append(raw_output[frame_start:frame_end])
+        parsed_any = True
+        i = frame_end
+
+    if parsed_any and i == total:
+        return b"".join(out_chunks).decode(errors="replace")
+    return raw_output.decode(errors="replace")
 
 
 async def run_asterisk_cmd(command: str) -> str:
