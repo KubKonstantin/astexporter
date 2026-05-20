@@ -116,6 +116,7 @@ call_duration = Histogram(
 active_channels: Dict[str, float] = {}
 active_bridges: Set[str] = set()
 queue_stats_cache: Dict[str, int] = {}
+queue_totals_cache: Dict[str, Dict[str, float]] = {}
 cli_error_logged = False
 for g in (asterisk_uptime_seconds, asterisk_active_channels, asterisk_active_calls):
     g.set(float("nan"))
@@ -351,6 +352,18 @@ def _extract_ami_command_output(response) -> str:
     return str(response).strip()
 
 
+def _iter_ami_events(response):
+    if response is None:
+        return
+    if isinstance(response, dict):
+        yield response
+        return
+    if isinstance(response, (list, tuple)):
+        for item in response:
+            if isinstance(item, dict):
+                yield item
+
+
 async def run_asterisk_command(command: str) -> str:
     if ENABLE_CLI:
         return await run_asterisk_cmd(command)
@@ -363,6 +376,33 @@ async def run_asterisk_command(command: str) -> str:
     if not output:
         raise RuntimeError(f"empty AMI Command output for: {command}")
     return output
+
+
+async def collect_pjsip_via_ami_actions() -> bool:
+    response = await manager.send_action({"Action": "PJSIPShowEndpoints"})
+    seen = 0
+    for event in _iter_ami_events(response):
+        if str(event.get("Event", "")).lower() != "endpointlist":
+            continue
+        endpoint = event.get("ObjectName") or event.get("EndpointName")
+        if not endpoint:
+            continue
+        seen += 1
+        status = event.get("DeviceState") or event.get("Status") or event.get("Active")
+        if status:
+            pjsip_endpoint_status.labels(endpoint=endpoint).set(_pjsip_status_to_value(str(status)))
+
+    reg_resp = await manager.send_action({"Action": "PJSIPShowRegistrationsOutbound"})
+    for event in _iter_ami_events(reg_resp):
+        ev = str(event.get("Event", "")).lower()
+        if ev not in {"outboundregistrationdetail", "outboundregistrationdetailcomplete"}:
+            if "registration" not in ev:
+                continue
+        reg = event.get("ObjectName") or event.get("Registration") or event.get("Endpoint")
+        status = str(event.get("Status") or event.get("State") or "")
+        if reg:
+            pjsip_registration_status.labels(registration=reg).set(1 if "registered" in status.lower() else 0)
+    return seen > 0
 
 
 async def collect_taskprocessors() -> None:
@@ -422,6 +462,11 @@ async def collect_core() -> None:
 async def collect_pjsip() -> None:
     while True:
         try:
+            collected = await collect_pjsip_via_ami_actions()
+            if collected:
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
             output = await run_asterisk_command("pjsip show endpoints")
             output = _normalize_command_output(output)
             current_endpoint = None
@@ -591,6 +636,53 @@ async def on_queue_abandon(_manager, event):
 async def collect_queues() -> None:
     while True:
         try:
+            queue_resp = await manager.send_action({"Action": "QueueStatus"})
+            got_queue_events = False
+            member_counts: Dict[str, int] = {}
+            snapshot_totals: Dict[str, Dict[str, float]] = {}
+            for event in _iter_ami_events(queue_resp):
+                ev = str(event.get("Event", "")).lower()
+                if ev == "queuemember":
+                    q = event.get("Queue")
+                    if q:
+                        got_queue_events = True
+                        member_counts[q] = member_counts.get(q, 0) + 1
+                elif ev == "queueparams":
+                    q = event.get("Queue")
+                    if q:
+                        got_queue_events = True
+                        with suppress(ValueError):
+                            queue_calls.labels(queue=q).set(float(event.get("Calls", 0)))
+                        with suppress(ValueError):
+                            queue_holdtime.labels(queue=q).set(float(event.get("Holdtime", 0)))
+                        with suppress(ValueError):
+                            snapshot_totals.setdefault(q, {})["completed"] = float(
+                                event.get("Completed", 0)
+                            )
+                        with suppress(ValueError):
+                            snapshot_totals.setdefault(q, {})["abandoned"] = float(
+                                event.get("Abandoned", 0)
+                            )
+            for q, count in member_counts.items():
+                queue_agents.labels(queue=q).set(count)
+            for q, totals in snapshot_totals.items():
+                prev = queue_totals_cache.get(q, {"completed": 0.0, "abandoned": 0.0})
+                completed = totals.get("completed", prev["completed"])
+                abandoned = totals.get("abandoned", prev["abandoned"])
+                if completed >= prev["completed"]:
+                    delta = completed - prev["completed"]
+                    if delta:
+                        queue_completed.labels(queue=q).inc(delta)
+                if abandoned >= prev["abandoned"]:
+                    delta = abandoned - prev["abandoned"]
+                    if delta:
+                        queue_abandoned.labels(queue=q).inc(delta)
+                queue_totals_cache[q] = {"completed": completed, "abandoned": abandoned}
+
+            if got_queue_events:
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
             output = await run_asterisk_command("queue show")
             output = _normalize_command_output(output)
             current_queue = None
