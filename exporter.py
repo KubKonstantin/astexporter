@@ -511,13 +511,8 @@ async def collect_core() -> None:
 async def collect_pjsip() -> None:
     while True:
         try:
-            collected, rtt_seen, reg_seen = await collect_pjsip_via_ami_actions()
-            # AMI endpoint list is preferred, but it often has no RTT details.
-            # Fall back to command parsing to enrich RTT / registration gauges when needed.
-            if collected and rtt_seen > 0 and reg_seen > 0:
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-
+            # Use "Action: Command" output path for endpoints/registrations parsing
+            # so behavior matches CLI table parsing semantics.
             output = await run_asterisk_command("pjsip show endpoints")
             output = _normalize_command_output(output)
             current_endpoint = None
