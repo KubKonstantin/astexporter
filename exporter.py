@@ -40,6 +40,7 @@ EXPORTER_PORT = int(os.getenv("EXPORTER_PORT", "9631"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "15"))
 ASTERISK_BIN = os.getenv("ASTERISK_BIN", "asterisk")
 ENABLE_CLI = os.getenv("ENABLE_CLI", "false").lower() == "true"
+ENABLE_AMI_COMMAND = os.getenv("ENABLE_AMI_COMMAND", "true").lower() == "true"
 COMMAND_TIMEOUT = float(os.getenv("COMMAND_TIMEOUT", "8"))
 CLI_REQUIRED = os.getenv("CLI_REQUIRED", "false").lower() == "true"
 
@@ -203,10 +204,47 @@ async def run_asterisk_cmd(command: str) -> str:
     return stdout.decode(errors="replace")
 
 
+def _extract_ami_command_output(response) -> str:
+    if response is None:
+        return ""
+    if isinstance(response, dict):
+        chunks = []
+        if "Output" in response and response["Output"] is not None:
+            chunks.append(str(response["Output"]))
+        if "data" in response and response["data"] is not None:
+            chunks.append(str(response["data"]))
+        return "\n".join(chunks).strip()
+    if isinstance(response, (list, tuple)):
+        chunks = []
+        for item in response:
+            if isinstance(item, dict):
+                out = item.get("Output")
+                if out is not None:
+                    chunks.append(str(out))
+            elif item is not None:
+                chunks.append(str(item))
+        return "\n".join(chunks).strip()
+    return str(response).strip()
+
+
+async def run_asterisk_command(command: str) -> str:
+    if ENABLE_CLI:
+        return await run_asterisk_cmd(command)
+
+    if not ENABLE_AMI_COMMAND:
+        raise RuntimeError("Both CLI and AMI command modes are disabled")
+
+    response = await manager.send_action({"Action": "Command", "Command": command})
+    output = _extract_ami_command_output(response)
+    if not output:
+        raise RuntimeError(f"empty AMI Command output for: {command}")
+    return output
+
+
 async def collect_taskprocessors() -> None:
     while True:
         try:
-            output = await run_asterisk_cmd("core show taskprocessors")
+            output = await run_asterisk_command("core show taskprocessors")
             seen: Set[str] = set()
             for line in output.splitlines():
                 match = TASKPROCESSOR_REGEX.search(line)
@@ -228,14 +266,14 @@ async def collect_taskprocessors() -> None:
 async def collect_core() -> None:
     while True:
         try:
-            uptime_output = await run_asterisk_cmd("core show uptime seconds")
+            uptime_output = await run_asterisk_command("core show uptime seconds")
             uptime_seconds = parse_uptime_seconds(uptime_output)
             if uptime_seconds is not None:
                 asterisk_uptime_seconds.set(uptime_seconds)
             else:
                 logger.warning("unable to parse uptime from output: %s", uptime_output.strip())
 
-            channels_output = await run_asterisk_cmd("core show channels count")
+            channels_output = await run_asterisk_command("core show channels count")
             channels_match = CHANNELS_REGEX.search(channels_output)
             calls_match = CALLS_REGEX.search(channels_output)
 
@@ -244,7 +282,7 @@ async def collect_core() -> None:
             if calls_match:
                 asterisk_active_calls.set(int(calls_match.group("calls")))
 
-            asterisk_cli_up.set(1)
+            asterisk_cli_up.set(1 if ENABLE_CLI else 0)
             update_asterisk_up()
         except Exception as exc:
             if cli_available or CLI_REQUIRED:
@@ -259,7 +297,7 @@ async def collect_core() -> None:
 async def collect_pjsip() -> None:
     while True:
         try:
-            output = await run_asterisk_cmd("pjsip show endpoints")
+            output = await run_asterisk_command("pjsip show endpoints")
             current_endpoint = None
             seen_endpoints: Set[str] = set()
             for line in output.splitlines():
@@ -277,7 +315,7 @@ async def collect_pjsip() -> None:
                     )
                     pjsip_endpoint_rtt.labels(endpoint=current_endpoint).set(rtt)
 
-            reg_output = await run_asterisk_cmd("pjsip show registrations")
+            reg_output = await run_asterisk_command("pjsip show registrations")
             for line in reg_output.splitlines():
                 match = REGISTRATION_OK_REGEX.search(line.strip())
                 if match:
@@ -363,7 +401,7 @@ async def on_queue_abandon(_manager, event):
 async def collect_queues() -> None:
     while True:
         try:
-            output = await run_asterisk_cmd("queue show")
+            output = await run_asterisk_command("queue show")
             current_queue = None
             for line in output.splitlines():
                 queue_match = QUEUE_REGEX.search(line)
@@ -406,22 +444,17 @@ async def main() -> None:
     site = web.TCPSite(runner, EXPORTER_HOST, EXPORTER_PORT)
     await site.start()
 
-    tasks = []
-    if ENABLE_CLI:
-        tasks.extend(
-            [
-                asyncio.create_task(collect_core()),
-                asyncio.create_task(collect_taskprocessors()),
-                asyncio.create_task(collect_pjsip()),
-                asyncio.create_task(collect_queues()),
-            ]
-        )
-    else:
-        logger.info("CLI collectors are disabled (ENABLE_CLI=false). Using AMI-first metrics mode.")
-
     await manager.connect()
     asterisk_ami_up.set(1)
     update_asterisk_up()
+    tasks = [
+        asyncio.create_task(collect_core()),
+        asyncio.create_task(collect_taskprocessors()),
+        asyncio.create_task(collect_pjsip()),
+        asyncio.create_task(collect_queues()),
+    ]
+    if not ENABLE_CLI:
+        logger.info("CLI disabled. Collecting command-based metrics via AMI Action: Command.")
     if ENABLE_CLI and shutil.which(ASTERISK_BIN) is None:
         logger.warning("Starting without CLI collectors: ASTERISK_BIN=%s not found", ASTERISK_BIN)
     logger.info("Exporter started on %s:%s", EXPORTER_HOST, EXPORTER_PORT)
