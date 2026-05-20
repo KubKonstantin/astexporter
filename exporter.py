@@ -326,16 +326,23 @@ async def _run_local_or_docker_cli(command: str) -> str:
 
 
 def _extract_ami_command_output(response) -> str:
+    def _clean_output_line(value) -> str:
+        text = str(value)
+        # Some AMI transports return each line prefixed with "Output: ".
+        if text.startswith("Output:"):
+            return text.split(":", 1)[1].lstrip()
+        return text
+
     if response is None:
         return ""
     if isinstance(response, dict):
         chunks = []
         if "Output" in response and response["Output"] is not None:
-            chunks.append(str(response["Output"]))
+            chunks.append(_clean_output_line(response["Output"]))
         if "output" in response and response["output"] is not None:
-            chunks.append(str(response["output"]))
+            chunks.append(_clean_output_line(response["output"]))
         if "data" in response and response["data"] is not None:
-            chunks.append(str(response["data"]))
+            chunks.append(_clean_output_line(response["data"]))
         return "\n".join(chunks).strip()
     if isinstance(response, (list, tuple)):
         chunks = []
@@ -343,26 +350,56 @@ def _extract_ami_command_output(response) -> str:
             if isinstance(item, dict):
                 out = item.get("Output")
                 if out is not None:
-                    chunks.append(str(out))
+                    chunks.append(_clean_output_line(out))
                 low_out = item.get("output")
                 if low_out is not None:
-                    chunks.append(str(low_out))
+                    chunks.append(_clean_output_line(low_out))
             elif item is not None:
-                chunks.append(str(item))
+                chunks.append(_clean_output_line(item))
         return "\n".join(chunks).strip()
-    return str(response).strip()
+    return _clean_output_line(response).strip()
 
 
 def _iter_ami_events(response):
     if response is None:
         return
+    if isinstance(response, str):
+        # Fallback parser for plain-text AMI dumps split by blank lines.
+        block: Dict[str, str] = {}
+        for raw_line in response.splitlines():
+            line = raw_line.strip("\r")
+            if not line.strip():
+                if block:
+                    yield block
+                    block = {}
+                continue
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            block[key.strip()] = value.strip()
+        if block:
+            yield block
+        return
     if isinstance(response, dict):
+        if isinstance(response.get("events"), list):
+            for item in response["events"]:
+                if isinstance(item, dict):
+                    yield item
+            return
         yield response
         return
     if isinstance(response, (list, tuple)):
         for item in response:
             if isinstance(item, dict):
                 yield item
+            elif isinstance(item, str):
+                for parsed in _iter_ami_events(item):
+                    yield parsed
+    else:
+        # Last-resort parsing for custom AMI response objects.
+        text = str(response)
+        for parsed in _iter_ami_events(text):
+            yield parsed
 
 
 async def run_asterisk_command(command: str) -> str:
@@ -379,9 +416,10 @@ async def run_asterisk_command(command: str) -> str:
     return output
 
 
-async def collect_pjsip_via_ami_actions() -> bool:
+async def collect_pjsip_via_ami_actions() -> tuple[bool, int, int]:
     response = await manager.send_action({"Action": "PJSIPShowEndpoints"})
     seen = 0
+    rtt_seen = 0
     for event in _iter_ami_events(response):
         if str(event.get("Event", "")).lower() != "endpointlist":
             continue
@@ -392,8 +430,14 @@ async def collect_pjsip_via_ami_actions() -> bool:
         status = event.get("DeviceState") or event.get("Status") or event.get("Active")
         if status:
             pjsip_endpoint_status.labels(endpoint=endpoint).set(_pjsip_status_to_value(str(status)))
+        rtt_raw = event.get("RoundtripUsec") or event.get("Roundtrip")
+        if rtt_raw:
+            with suppress(ValueError):
+                pjsip_endpoint_rtt.labels(endpoint=endpoint).set(float(rtt_raw) / 1000.0)
+                rtt_seen += 1
 
     reg_resp = await manager.send_action({"Action": "PJSIPShowRegistrationsOutbound"})
+    reg_seen = 0
     for event in _iter_ami_events(reg_resp):
         ev = str(event.get("Event", "")).lower()
         if ev not in {"outboundregistrationdetail", "outboundregistrationdetailcomplete"}:
@@ -403,7 +447,8 @@ async def collect_pjsip_via_ami_actions() -> bool:
         status = str(event.get("Status") or event.get("State") or "")
         if reg:
             pjsip_registration_status.labels(registration=reg).set(1 if "registered" in status.lower() else 0)
-    return seen > 0
+            reg_seen += 1
+    return seen > 0, rtt_seen, reg_seen
 
 
 async def collect_taskprocessors() -> None:
@@ -463,8 +508,10 @@ async def collect_core() -> None:
 async def collect_pjsip() -> None:
     while True:
         try:
-            collected = await collect_pjsip_via_ami_actions()
-            if collected:
+            collected, rtt_seen, reg_seen = await collect_pjsip_via_ami_actions()
+            # AMI endpoint list is preferred, but it often has no RTT details.
+            # Fall back to command parsing to enrich RTT / registration gauges when needed.
+            if collected and rtt_seen > 0 and reg_seen > 0:
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
