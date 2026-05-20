@@ -329,9 +329,13 @@ def _extract_ami_command_output(response) -> str:
     def _clean_output_line(value) -> str:
         text = str(value)
         # Some AMI transports return each line prefixed with "Output: ".
-        if text.startswith("Output:"):
-            return text.split(":", 1)[1].lstrip()
-        return text
+        lines = []
+        for raw_line in text.splitlines():
+            if raw_line.startswith("Output:"):
+                lines.append(raw_line.split(":", 1)[1].lstrip())
+            else:
+                lines.append(raw_line)
+        return "\n".join(lines)
 
     if response is None:
         return ""
