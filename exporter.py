@@ -9,7 +9,7 @@ from asyncio.subprocess import PIPE
 from contextlib import suppress
 from typing import Dict, Set
 
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
 from panoramisk import Manager
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -41,6 +41,8 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "15"))
 ASTERISK_BIN = os.getenv("ASTERISK_BIN", "asterisk")
 ENABLE_CLI = os.getenv("ENABLE_CLI", "false").lower() == "true"
 ENABLE_AMI_COMMAND = os.getenv("ENABLE_AMI_COMMAND", "true").lower() == "true"
+CLI_DOCKER_SOCKET = os.getenv("CLI_DOCKER_SOCKET", "/var/run/docker.sock")
+CLI_DOCKER_CONTAINER = os.getenv("CLI_DOCKER_CONTAINER", "voip-asterisk")
 COMMAND_TIMEOUT = float(os.getenv("COMMAND_TIMEOUT", "8"))
 CLI_REQUIRED = os.getenv("CLI_REQUIRED", "false").lower() == "true"
 
@@ -157,6 +159,66 @@ def parse_uptime_seconds(output: str) -> int | None:
 update_asterisk_up()
 
 
+async def _run_subprocess_cmd(cmd: list[str], command_name: str) -> str:
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=COMMAND_TIMEOUT)
+    except asyncio.TimeoutError:
+        with suppress(ProcessLookupError):
+            proc.kill()
+        raise RuntimeError(f"timeout running: {command_name}")
+
+    if proc.returncode != 0:
+        err = stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"{command_name} failed: {err}")
+    return stdout.decode(errors="replace")
+
+
+async def run_asterisk_cmd_via_docker_socket(command: str) -> str:
+    global cli_available, cli_error_logged
+
+    connector = UnixConnector(path=CLI_DOCKER_SOCKET)
+    timeout = ClientTimeout(total=COMMAND_TIMEOUT)
+    async with ClientSession(connector=connector, timeout=timeout) as session:
+        create_payload = {
+            "AttachStdout": True,
+            "AttachStderr": True,
+            "Tty": False,
+            "Cmd": [ASTERISK_BIN, "-rx", command],
+        }
+        async with session.post(
+            f"http://docker/containers/{CLI_DOCKER_CONTAINER}/exec",
+            json=create_payload,
+        ) as resp:
+            create_body = await resp.json(content_type=None)
+            if resp.status >= 400:
+                raise RuntimeError(f"docker exec create failed ({resp.status}): {create_body}")
+            exec_id = create_body.get("Id")
+            if not exec_id:
+                raise RuntimeError(f"docker exec create returned no Id: {create_body}")
+
+        async with session.post(
+            f"http://docker/exec/{exec_id}/start",
+            json={"Detach": False, "Tty": False},
+        ) as resp:
+            raw_output = await resp.read()
+            if resp.status >= 400:
+                raise RuntimeError(
+                    f"docker exec start failed ({resp.status}): {raw_output.decode(errors='replace')}"
+                )
+
+        async with session.get(f"http://docker/exec/{exec_id}/json") as resp:
+            inspect_body = await resp.json(content_type=None)
+            if resp.status >= 400:
+                raise RuntimeError(f"docker exec inspect failed ({resp.status}): {inspect_body}")
+
+    exit_code = inspect_body.get("ExitCode")
+    decoded = raw_output.decode(errors="replace")
+    if exit_code not in (0, None):
+        raise RuntimeError(f"{command} failed in container '{CLI_DOCKER_CONTAINER}': {decoded.strip()}")
+    return decoded
+
+
 async def run_asterisk_cmd(command: str) -> str:
     global cli_available, cli_error_logged
 
@@ -166,42 +228,29 @@ async def run_asterisk_cmd(command: str) -> str:
     if not ENABLE_CLI:
         raise RuntimeError("CLI collection is disabled (ENABLE_CLI=false)")
 
-    if shutil.which(ASTERISK_BIN) is None:
+    try:
+        return await _run_local_or_docker_cli(command)
+    except Exception as exc:
         cli_available = False
         asterisk_cli_up.set(0)
         update_asterisk_up()
         if not cli_error_logged:
             logger.error(
-                "Asterisk CLI binary '%s' not found in PATH. "
-                "For containerized setup prefer AMI metrics; only enable CLI when binary is available in astexporter container.",
+                "CLI transport failed for '%s'. local_bin=%s docker_socket=%s container=%s error=%s",
+                command,
                 ASTERISK_BIN,
+                CLI_DOCKER_SOCKET,
+                CLI_DOCKER_CONTAINER,
+                exc,
             )
             cli_error_logged = True
-        raise RuntimeError(f"{ASTERISK_BIN} not found")
-    cmd = [ASTERISK_BIN, "-rx", command]
+        raise RuntimeError(str(exc))
 
-    proc = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=COMMAND_TIMEOUT)
-    except asyncio.TimeoutError:
-        with suppress(ProcessLookupError):
-            proc.kill()
-        raise RuntimeError(f"timeout running: {command}")
 
-    if proc.returncode != 0:
-        err = stderr.decode(errors="replace").strip()
-        if "not found" in err.lower():
-            cli_available = False
-            asterisk_cli_up.set(0)
-            update_asterisk_up()
-            if not cli_error_logged:
-                logger.error(
-                    "Asterisk CLI command failed because executable/container was not found: %s",
-                    err,
-                )
-                cli_error_logged = True
-        raise RuntimeError(f"{command} failed: {err}")
-    return stdout.decode(errors="replace")
+async def _run_local_or_docker_cli(command: str) -> str:
+    if shutil.which(ASTERISK_BIN) is not None:
+        return await _run_subprocess_cmd([ASTERISK_BIN, "-rx", command], command)
+    return await run_asterisk_cmd_via_docker_socket(command)
 
 
 def _extract_ami_command_output(response) -> str:
