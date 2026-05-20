@@ -132,9 +132,19 @@ CONTACT_REGEX = re.compile(
     r"Contact:\s+.*\bAvail:\s*(?P<status>[A-Za-z]+)(?:\s+.*RTT:\s*(?P<rtt>[\d\.]+))?"
 )
 REGISTRATION_OK_REGEX = re.compile(r"^(?P<name>\S+)\s+Registered\b")
-QUEUE_REGEX = re.compile(r"(?P<queue>\S+)\s+has\s+(?P<calls>\d+)\s+calls")
-MEMBER_REGEX = re.compile(r"Members:\s+(?P<count>\d+)")
-HOLDTIME_REGEX = re.compile(r"holdtime\s+(?P<holdtime>\d+)")
+REGISTRATION_ANY_REGEX = re.compile(
+    r"^(?P<name>\S+)\s+(?P<state>Registered|Rejected|Unregistered|Request Sent|No Authentication)\b",
+    re.IGNORECASE,
+)
+QUEUE_REGEX = re.compile(
+    r"^(?P<queue>\S+)\s+has\s+(?P<calls>\d+)\s+calls.*?(?P<agents>\d+)\s+members?",
+    re.IGNORECASE,
+)
+QUEUE_CALLS_FALLBACK_REGEX = re.compile(r"^(?P<queue>\S+)\s+has\s+(?P<calls>\d+)\s+calls", re.IGNORECASE)
+MEMBER_REGEX = re.compile(r"Members:\s+(?P<count>\d+)", re.IGNORECASE)
+HOLDTIME_REGEX = re.compile(r"holdtime\s+(?P<holdtime>\d+)", re.IGNORECASE)
+QUEUE_COMPLETED_REGEX = re.compile(r"\bC:(?P<completed>\d+)\b")
+QUEUE_ABANDONED_REGEX = re.compile(r"\bA:(?P<abandoned>\d+)\b")
 
 
 
@@ -148,6 +158,11 @@ def _pjsip_status_to_value(status: str) -> int:
     if st in {"avail", "available", "ok", "reachable", "lagged"}:
         return 1
     return 0
+
+
+def _normalize_command_output(text: str) -> str:
+    # Some transports (docker exec / AMI command) may contain CR chars.
+    return text.replace("\r", "")
 
 
 def parse_uptime_seconds(output: str) -> int | None:
@@ -391,6 +406,7 @@ async def collect_pjsip() -> None:
     while True:
         try:
             output = await run_asterisk_command("pjsip show endpoints")
+            output = _normalize_command_output(output)
             current_endpoint = None
             seen_endpoints: Set[str] = set()
             for line in output.splitlines():
@@ -424,10 +440,14 @@ async def collect_pjsip() -> None:
                             pjsip_endpoint_rtt.labels(endpoint=current_endpoint).set(float(rtt))
 
             reg_output = await run_asterisk_command("pjsip show registrations")
+            reg_output = _normalize_command_output(reg_output)
             for line in reg_output.splitlines():
-                match = REGISTRATION_OK_REGEX.search(line.strip())
+                match = REGISTRATION_ANY_REGEX.search(line.strip())
                 if match:
-                    pjsip_registration_status.labels(registration=match.group("name")).set(1)
+                    state = match.group("state").lower()
+                    pjsip_registration_status.labels(registration=match.group("name")).set(
+                        1 if state == "registered" else 0
+                    )
         except Exception as exc:
             if ENABLE_CLI or CLI_REQUIRED:
                 logger.exception("pjsip collector error")
@@ -510,12 +530,27 @@ async def collect_queues() -> None:
     while True:
         try:
             output = await run_asterisk_command("queue show")
+            output = _normalize_command_output(output)
             current_queue = None
+            current_members = 0
             for line in output.splitlines():
                 queue_match = QUEUE_REGEX.search(line)
                 if queue_match:
                     current_queue = queue_match.group("queue")
                     queue_calls.labels(queue=current_queue).set(int(queue_match.group("calls")))
+                    queue_agents.labels(queue=current_queue).set(int(queue_match.group("agents")))
+                    current_members = 0
+                    holdtime_match = HOLDTIME_REGEX.search(line)
+                    if holdtime_match:
+                        queue_holdtime.labels(queue=current_queue).set(int(holdtime_match.group("holdtime")))
+                    continue
+                queue_calls_fallback_match = QUEUE_CALLS_FALLBACK_REGEX.search(line)
+                if queue_calls_fallback_match:
+                    current_queue = queue_calls_fallback_match.group("queue")
+                    queue_calls.labels(queue=current_queue).set(
+                        int(queue_calls_fallback_match.group("calls"))
+                    )
+                    current_members = 0
                     continue
 
                 member_match = MEMBER_REGEX.search(line)
@@ -525,6 +560,9 @@ async def collect_queues() -> None:
                 holdtime_match = HOLDTIME_REGEX.search(line)
                 if holdtime_match and current_queue:
                     queue_holdtime.labels(queue=current_queue).set(int(holdtime_match.group("holdtime")))
+                if current_queue and line.startswith("   ") and "(" in line and ")" in line:
+                    current_members += 1
+                    queue_agents.labels(queue=current_queue).set(current_members)
         except Exception as exc:
             if ENABLE_CLI or CLI_REQUIRED:
                 logger.exception("queue collector error")
