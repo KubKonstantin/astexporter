@@ -42,6 +42,7 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "15"))
 ASTERISK_BIN = os.getenv("ASTERISK_BIN", "asterisk")
 ENABLE_CLI = os.getenv("ENABLE_CLI", "false").lower() == "true"
 ENABLE_AMI_COMMAND = os.getenv("ENABLE_AMI_COMMAND", "true").lower() == "true"
+FORCE_AMI_COMMAND = os.getenv("FORCE_AMI_COMMAND", "true").lower() == "true"
 CLI_DOCKER_SOCKET = os.getenv("CLI_DOCKER_SOCKET", "/var/run/docker.sock")
 CLI_DOCKER_CONTAINER = os.getenv("CLI_DOCKER_CONTAINER", "voip-asterisk")
 COMMAND_TIMEOUT = float(os.getenv("COMMAND_TIMEOUT", "8"))
@@ -365,7 +366,7 @@ def _iter_ami_events(response):
 
 
 async def run_asterisk_command(command: str) -> str:
-    if ENABLE_CLI:
+    if ENABLE_CLI and not FORCE_AMI_COMMAND:
         return await run_asterisk_cmd(command)
 
     if not ENABLE_AMI_COMMAND:
@@ -420,7 +421,7 @@ async def collect_taskprocessors() -> None:
                 taskprocessor_processed.labels(name=name).set(int(match.group("processed")))
                 taskprocessor_high_water.labels(name=name).set(int(match.group("maxdepth")))
         except Exception as exc:
-            if ENABLE_CLI or CLI_REQUIRED:
+            if (ENABLE_CLI and not FORCE_AMI_COMMAND) or CLI_REQUIRED:
                 logger.exception("taskprocessor collector error")
             else:
                 logger.debug("taskprocessor collector skipped: %s", exc)
@@ -446,14 +447,14 @@ async def collect_core() -> None:
             if calls_match:
                 asterisk_active_calls.set(int(calls_match.group("calls")))
 
-            asterisk_cli_up.set(1 if ENABLE_CLI else 0)
+            asterisk_cli_up.set(1 if (ENABLE_CLI and not FORCE_AMI_COMMAND) else 0)
             update_asterisk_up()
         except Exception as exc:
-            if ENABLE_CLI or CLI_REQUIRED:
+            if (ENABLE_CLI and not FORCE_AMI_COMMAND) or CLI_REQUIRED:
                 logger.exception("core collector error")
             else:
                 logger.debug("core collector skipped: %s", exc)
-            if ENABLE_CLI:
+            if ENABLE_CLI and not FORCE_AMI_COMMAND:
                 asterisk_cli_up.set(0)
         update_asterisk_up()
         await asyncio.sleep(POLL_INTERVAL)
@@ -533,7 +534,7 @@ async def collect_pjsip() -> None:
                         1 if state == "registered" else 0
                     )
         except Exception as exc:
-            if ENABLE_CLI or CLI_REQUIRED:
+            if (ENABLE_CLI and not FORCE_AMI_COMMAND) or CLI_REQUIRED:
                 logger.exception("pjsip collector error")
             else:
                 logger.debug("pjsip collector skipped: %s", exc)
@@ -718,7 +719,7 @@ async def collect_queues() -> None:
                     current_members += 1
                     queue_agents.labels(queue=current_queue).set(current_members)
         except Exception as exc:
-            if ENABLE_CLI or CLI_REQUIRED:
+            if (ENABLE_CLI and not FORCE_AMI_COMMAND) or CLI_REQUIRED:
                 logger.exception("queue collector error")
             else:
                 logger.debug("queue collector skipped: %s", exc)
@@ -753,6 +754,10 @@ async def main() -> None:
         asyncio.create_task(collect_pjsip()),
         asyncio.create_task(collect_queues()),
     ]
+    if FORCE_AMI_COMMAND:
+        logger.info("Command collectors are forced to AMI Action: Command (FORCE_AMI_COMMAND=true)")
+    elif ENABLE_CLI:
+        logger.info("Command collectors use CLI transport when enabled.")
     if not ENABLE_CLI:
         logger.info("CLI disabled. Collecting command-based metrics via AMI Action: Command.")
     if ENABLE_CLI and shutil.which(ASTERISK_BIN) is None:
