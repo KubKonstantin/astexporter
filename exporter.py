@@ -19,6 +19,7 @@ from prometheus_client import (
     Histogram,
     generate_latest,
 )
+import prometheus_client
 
 
 try:
@@ -51,6 +52,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("astexporter")
+
+if hasattr(prometheus_client, "disable_created_metrics"):
+    prometheus_client.disable_created_metrics()
 
 registry = CollectorRegistry()
 
@@ -124,18 +128,23 @@ TASKPROCESSOR_REGEX = re.compile(
 UPTIME_REGEX = re.compile(r"System uptime:\s*(?P<seconds>\d+)")
 CHANNELS_REGEX = re.compile(r"(?P<channels>\d+) active channels")
 CALLS_REGEX = re.compile(r"(?P<calls>\d+) active calls")
-ENDPOINT_REGEX = re.compile(r"Endpoint:\s+(?P<endpoint>\S+)")
+ENDPOINT_REGEX = re.compile(r"Endpoint:\s+(?P<endpoint>[^\s(]+)")
 ENDPOINT_STATUS_INLINE_REGEX = re.compile(
-    r"Endpoint:\s+\S+.*\bAvail:\s*(?P<status>[A-Za-z]+)(?:\s+.*RTT:\s*(?P<rtt>[\d\.]+))?"
-)
-CONTACT_REGEX = re.compile(
-    r"Contact:\s+.*\bAvail:\s*(?P<status>[A-Za-z]+)(?:\s+.*RTT:\s*(?P<rtt>[\d\.]+))?"
-)
-REGISTRATION_OK_REGEX = re.compile(r"^(?P<name>\S+)\s+Registered\b")
-REGISTRATION_ANY_REGEX = re.compile(
-    r"^(?P<name>\S+)\s+(?P<state>Registered|Rejected|Unregistered|Request Sent|No Authentication)\b",
+    r"\bAvail(?:able)?[:\s]+(?P<status>[A-Za-z]+)|\b(?P<state>Unavailable|Unknown|Reachable|NonQual)\b",
     re.IGNORECASE,
 )
+CONTACT_REGEX = re.compile(
+    r"Contact:\s+.*?(?:\bAvail(?:able)?[:\s]+(?P<status>[A-Za-z]+)|\b(?P<state>Unavailable|Unknown|Reachable|NonQual)\b)",
+    re.IGNORECASE,
+)
+RTT_REGEX = re.compile(r"\bRTT[:\s]+(?P<rtt>[\d\.]+)", re.IGNORECASE)
+REGISTRATION_OK_REGEX = re.compile(r"^(?P<name>\S+)\s+Registered\b")
+REGISTRATION_ANY_REGEX = re.compile(
+    r"(?P<name>\S+)\s+(?P<state>Registered|Rejected|Unregistered|Request Sent|No Authentication|Failed|Timeout)",
+    re.IGNORECASE,
+)
+OUTBOUND_REG_REGEX = re.compile(r"Outbound Registration:\s*(?P<name>\S+)", re.IGNORECASE)
+REG_STATUS_REGEX = re.compile(r"\b(?:Status|State)\s*:\s*(?P<state>.+)$", re.IGNORECASE)
 QUEUE_REGEX = re.compile(
     r"^(?P<queue>\S+)\s+has\s+(?P<calls>\d+)\s+calls.*?(?P<agents>\d+)\s+members?",
     re.IGNORECASE,
@@ -158,6 +167,10 @@ def _pjsip_status_to_value(status: str) -> int:
     if st in {"avail", "available", "ok", "reachable", "lagged"}:
         return 1
     return 0
+
+
+def _extract_status(match) -> str:
+    return (match.groupdict().get("status") or match.groupdict().get("state") or "").strip()
 
 
 def _normalize_command_output(text: str) -> str:
@@ -416,11 +429,12 @@ async def collect_pjsip() -> None:
                     inline_match = ENDPOINT_STATUS_INLINE_REGEX.search(line)
                     if inline_match:
                         seen_endpoints.add(current_endpoint)
-                        status = inline_match.group("status")
+                        status = _extract_status(inline_match)
                         pjsip_endpoint_status.labels(endpoint=current_endpoint).set(
                             _pjsip_status_to_value(status)
                         )
-                        inline_rtt = inline_match.group("rtt")
+                        rtt_match = RTT_REGEX.search(line)
+                        inline_rtt = rtt_match.group("rtt") if rtt_match else None
                         if inline_rtt:
                             with suppress(ValueError):
                                 pjsip_endpoint_rtt.labels(endpoint=current_endpoint).set(
@@ -430,18 +444,31 @@ async def collect_pjsip() -> None:
                 contact_match = CONTACT_REGEX.search(line)
                 if contact_match and current_endpoint:
                     seen_endpoints.add(current_endpoint)
-                    status = contact_match.group("status")
+                    status = _extract_status(contact_match)
                     pjsip_endpoint_status.labels(endpoint=current_endpoint).set(
                         _pjsip_status_to_value(status)
                     )
-                    rtt = contact_match.group("rtt")
+                    rtt_match = RTT_REGEX.search(line)
+                    rtt = rtt_match.group("rtt") if rtt_match else None
                     if rtt:
                         with suppress(ValueError):
                             pjsip_endpoint_rtt.labels(endpoint=current_endpoint).set(float(rtt))
 
             reg_output = await run_asterisk_command("pjsip show registrations")
             reg_output = _normalize_command_output(reg_output)
+            current_registration = None
             for line in reg_output.splitlines():
+                out_match = OUTBOUND_REG_REGEX.search(line.strip())
+                if out_match:
+                    current_registration = out_match.group("name")
+                    continue
+                state_match = REG_STATUS_REGEX.search(line.strip())
+                if current_registration and state_match:
+                    state = state_match.group("state").lower()
+                    pjsip_registration_status.labels(registration=current_registration).set(
+                        1 if "registered" in state else 0
+                    )
+                    continue
                 match = REGISTRATION_ANY_REGEX.search(line.strip())
                 if match:
                     state = match.group("state").lower()
@@ -498,6 +525,29 @@ async def on_bridge_leave(_manager, event):
     if bridge_id and bridge_id in active_bridges:
         active_bridges.discard(bridge_id)
     asterisk_active_calls.set(len(active_bridges))
+
+
+@manager.register_event("ContactStatus")
+async def on_contact_status(_manager, event):
+    endpoint = event.get("EndpointName") or event.get("AOR")
+    status = event.get("ContactStatus") or event.get("Status") or ""
+    rtt = event.get("RoundtripUsec") or event.get("Roundtrip") or ""
+    if endpoint:
+        pjsip_endpoint_status.labels(endpoint=endpoint).set(_pjsip_status_to_value(status))
+        if rtt:
+            with suppress(ValueError):
+                # RoundtripUsec from AMI is in microseconds.
+                pjsip_endpoint_rtt.labels(endpoint=endpoint).set(float(rtt) / 1000.0)
+
+
+@manager.register_event("Registry")
+async def on_registry(_manager, event):
+    registration = event.get("Domain") or event.get("Username") or event.get("ChannelType")
+    state = event.get("Status") or ""
+    if registration:
+        pjsip_registration_status.labels(registration=registration).set(
+            1 if "registered" in state.lower() else 0
+        )
 
 
 @manager.register_event("QueueCallerJoin")
