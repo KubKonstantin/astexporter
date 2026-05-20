@@ -364,6 +364,15 @@ def _extract_ami_command_output(response) -> str:
     return _clean_output_line(response).strip()
 
 
+def _extract_output_lines_from_text(text: str) -> str:
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip("\r")
+        if line.startswith("Output:"):
+            lines.append(line.split(":", 1)[1].lstrip())
+    return "\n".join(lines).strip()
+
+
 def _iter_ami_events(response):
     if response is None:
         return
@@ -415,6 +424,19 @@ async def run_asterisk_command(command: str) -> str:
 
     response = await manager.send_action({"Action": "Command", "Command": command})
     output = _extract_ami_command_output(response)
+    if not output:
+        # Fallback for AMI clients returning full text transcript
+        # instead of structured Output fields.
+        output = _extract_output_lines_from_text(str(response))
+    if not output:
+        # Last chance: parse as AMI key-value event blocks and collect Output keys.
+        parsed_chunks = []
+        for event in _iter_ami_events(response):
+            if "Output" in event:
+                parsed_chunks.append(str(event.get("Output", "")))
+            elif "output" in event:
+                parsed_chunks.append(str(event.get("output", "")))
+        output = "\n".join(parsed_chunks).strip()
     if not output:
         raise RuntimeError(f"empty AMI Command output for: {command}")
     return output
