@@ -112,7 +112,6 @@ call_duration = Histogram(
 active_channels: Dict[str, float] = {}
 active_bridges: Set[str] = set()
 queue_stats_cache: Dict[str, int] = {}
-cli_available = True
 cli_error_logged = False
 for g in (asterisk_uptime_seconds, asterisk_active_channels, asterisk_active_calls):
     g.set(float("nan"))
@@ -126,7 +125,12 @@ UPTIME_REGEX = re.compile(r"System uptime:\s*(?P<seconds>\d+)")
 CHANNELS_REGEX = re.compile(r"(?P<channels>\d+) active channels")
 CALLS_REGEX = re.compile(r"(?P<calls>\d+) active calls")
 ENDPOINT_REGEX = re.compile(r"Endpoint:\s+(?P<endpoint>\S+)")
-CONTACT_REGEX = re.compile(r"Contact:\s+.*Avail:\s+(?P<status>\w+).*RTT:\s+(?P<rtt>[\d\.]+)")
+ENDPOINT_STATUS_INLINE_REGEX = re.compile(
+    r"Endpoint:\s+\S+.*\bAvail:\s*(?P<status>[A-Za-z]+)(?:\s+.*RTT:\s*(?P<rtt>[\d\.]+))?"
+)
+CONTACT_REGEX = re.compile(
+    r"Contact:\s+.*\bAvail:\s*(?P<status>[A-Za-z]+)(?:\s+.*RTT:\s*(?P<rtt>[\d\.]+))?"
+)
 REGISTRATION_OK_REGEX = re.compile(r"^(?P<name>\S+)\s+Registered\b")
 QUEUE_REGEX = re.compile(r"(?P<queue>\S+)\s+has\s+(?P<calls>\d+)\s+calls")
 MEMBER_REGEX = re.compile(r"Members:\s+(?P<count>\d+)")
@@ -137,6 +141,13 @@ HOLDTIME_REGEX = re.compile(r"holdtime\s+(?P<holdtime>\d+)")
 
 def update_asterisk_up() -> None:
     asterisk_up.set(1 if (asterisk_ami_up._value.get() > 0 or asterisk_cli_up._value.get() > 0) else 0)
+
+
+def _pjsip_status_to_value(status: str) -> int:
+    st = status.lower()
+    if st in {"avail", "available", "ok", "reachable", "lagged"}:
+        return 1
+    return 0
 
 
 def parse_uptime_seconds(output: str) -> int | None:
@@ -248,18 +259,17 @@ def _decode_docker_exec_output(raw_output: bytes) -> str:
 
 
 async def run_asterisk_cmd(command: str) -> str:
-    global cli_available, cli_error_logged
-
-    if not cli_available:
-        raise RuntimeError("asterisk CLI unavailable")
+    global cli_error_logged
 
     if not ENABLE_CLI:
         raise RuntimeError("CLI collection is disabled (ENABLE_CLI=false)")
 
     try:
-        return await _run_local_or_docker_cli(command)
+        output = await _run_local_or_docker_cli(command)
+        asterisk_cli_up.set(1)
+        update_asterisk_up()
+        return output
     except Exception as exc:
-        cli_available = False
         asterisk_cli_up.set(0)
         update_asterisk_up()
         if not cli_error_logged:
@@ -288,6 +298,8 @@ def _extract_ami_command_output(response) -> str:
         chunks = []
         if "Output" in response and response["Output"] is not None:
             chunks.append(str(response["Output"]))
+        if "output" in response and response["output"] is not None:
+            chunks.append(str(response["output"]))
         if "data" in response and response["data"] is not None:
             chunks.append(str(response["data"]))
         return "\n".join(chunks).strip()
@@ -298,6 +310,9 @@ def _extract_ami_command_output(response) -> str:
                 out = item.get("Output")
                 if out is not None:
                     chunks.append(str(out))
+                low_out = item.get("output")
+                if low_out is not None:
+                    chunks.append(str(low_out))
             elif item is not None:
                 chunks.append(str(item))
         return "\n".join(chunks).strip()
@@ -333,7 +348,7 @@ async def collect_taskprocessors() -> None:
                 taskprocessor_processed.labels(name=name).set(int(match.group("processed")))
                 taskprocessor_high_water.labels(name=name).set(int(match.group("maxdepth")))
         except Exception as exc:
-            if cli_available or CLI_REQUIRED:
+            if ENABLE_CLI or CLI_REQUIRED:
                 logger.exception("taskprocessor collector error")
             else:
                 logger.debug("taskprocessor collector skipped: %s", exc)
@@ -362,11 +377,12 @@ async def collect_core() -> None:
             asterisk_cli_up.set(1 if ENABLE_CLI else 0)
             update_asterisk_up()
         except Exception as exc:
-            if cli_available or CLI_REQUIRED:
+            if ENABLE_CLI or CLI_REQUIRED:
                 logger.exception("core collector error")
             else:
                 logger.debug("core collector skipped: %s", exc)
-            asterisk_cli_up.set(0)
+            if ENABLE_CLI:
+                asterisk_cli_up.set(0)
         update_asterisk_up()
         await asyncio.sleep(POLL_INTERVAL)
 
@@ -381,16 +397,31 @@ async def collect_pjsip() -> None:
                 endpoint_match = ENDPOINT_REGEX.search(line)
                 if endpoint_match:
                     current_endpoint = endpoint_match.group("endpoint")
+                    inline_match = ENDPOINT_STATUS_INLINE_REGEX.search(line)
+                    if inline_match:
+                        seen_endpoints.add(current_endpoint)
+                        status = inline_match.group("status")
+                        pjsip_endpoint_status.labels(endpoint=current_endpoint).set(
+                            _pjsip_status_to_value(status)
+                        )
+                        inline_rtt = inline_match.group("rtt")
+                        if inline_rtt:
+                            with suppress(ValueError):
+                                pjsip_endpoint_rtt.labels(endpoint=current_endpoint).set(
+                                    float(inline_rtt)
+                                )
                     continue
                 contact_match = CONTACT_REGEX.search(line)
                 if contact_match and current_endpoint:
                     seen_endpoints.add(current_endpoint)
                     status = contact_match.group("status")
-                    rtt = float(contact_match.group("rtt"))
                     pjsip_endpoint_status.labels(endpoint=current_endpoint).set(
-                        1 if status.lower() == "avail" else 0
+                        _pjsip_status_to_value(status)
                     )
-                    pjsip_endpoint_rtt.labels(endpoint=current_endpoint).set(rtt)
+                    rtt = contact_match.group("rtt")
+                    if rtt:
+                        with suppress(ValueError):
+                            pjsip_endpoint_rtt.labels(endpoint=current_endpoint).set(float(rtt))
 
             reg_output = await run_asterisk_command("pjsip show registrations")
             for line in reg_output.splitlines():
@@ -398,7 +429,7 @@ async def collect_pjsip() -> None:
                 if match:
                     pjsip_registration_status.labels(registration=match.group("name")).set(1)
         except Exception as exc:
-            if cli_available or CLI_REQUIRED:
+            if ENABLE_CLI or CLI_REQUIRED:
                 logger.exception("pjsip collector error")
             else:
                 logger.debug("pjsip collector skipped: %s", exc)
@@ -495,7 +526,7 @@ async def collect_queues() -> None:
                 if holdtime_match and current_queue:
                     queue_holdtime.labels(queue=current_queue).set(int(holdtime_match.group("holdtime")))
         except Exception as exc:
-            if cli_available or CLI_REQUIRED:
+            if ENABLE_CLI or CLI_REQUIRED:
                 logger.exception("queue collector error")
             else:
                 logger.debug("queue collector skipped: %s", exc)
