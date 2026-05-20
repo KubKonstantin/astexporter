@@ -457,7 +457,10 @@ async def collect_taskprocessors() -> None:
             output = await run_asterisk_command("core show taskprocessors")
             seen: Set[str] = set()
             for line in output.splitlines():
-                match = TASKPROCESSOR_REGEX.search(line)
+                stripped = line.strip()
+                if not stripped or stripped.lower().startswith("processor "):
+                    continue
+                match = TASKPROCESSOR_REGEX.search(stripped)
                 if not match:
                     continue
                 name = match.group("name")
@@ -508,13 +511,8 @@ async def collect_core() -> None:
 async def collect_pjsip() -> None:
     while True:
         try:
-            collected, rtt_seen, reg_seen = await collect_pjsip_via_ami_actions()
-            # AMI endpoint list is preferred, but it often has no RTT details.
-            # Fall back to command parsing to enrich RTT / registration gauges when needed.
-            if collected and rtt_seen > 0 and reg_seen > 0:
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-
+            # Use "Action: Command" output path for endpoints/registrations parsing
+            # so behavior matches CLI table parsing semantics.
             output = await run_asterisk_command("pjsip show endpoints")
             output = _normalize_command_output(output)
             current_endpoint = None
@@ -523,6 +521,9 @@ async def collect_pjsip() -> None:
                 endpoint_match = ENDPOINT_REGEX.search(line)
                 if endpoint_match:
                     current_endpoint = endpoint_match.group("endpoint")
+                    if current_endpoint.startswith("<"):
+                        current_endpoint = None
+                        continue
                     inline_match = ENDPOINT_STATUS_INLINE_REGEX.search(line)
                     if inline_match:
                         seen_endpoints.add(current_endpoint)
@@ -711,6 +712,8 @@ async def collect_queues() -> None:
                             snapshot_totals.setdefault(q, {})["abandoned"] = float(
                                 event.get("Abandoned", 0)
                             )
+            if not got_queue_events:
+                logger.debug("QueueStatus AMI returned no queue events; falling back to command parser")
             for q, count in member_counts.items():
                 queue_agents.labels(queue=q).set(count)
             for q, totals in snapshot_totals.items():
