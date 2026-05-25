@@ -202,6 +202,26 @@ def parse_uptime_seconds(output: str) -> int | None:
     return total if found else None
 
 
+def _parse_taskprocessor_line(line: str) -> tuple[str, int, int, int] | None:
+    # Asterisk table output is typically:
+    # Processor  Processed  In Queue  Max Depth  Low water  High water
+    # Name may include separators, so parse from numeric tail.
+    tokens = line.split()
+    if len(tokens) < 6:
+        return None
+    tail = tokens[-5:]
+    if not all(token.isdigit() for token in tail):
+        return None
+    name_tokens = tokens[:-5]
+    if not name_tokens:
+        return None
+    name = " ".join(name_tokens)
+    processed = int(tail[0])
+    inqueue = int(tail[1])
+    maxdepth = int(tail[2])
+    return name, processed, inqueue, maxdepth
+
+
 update_asterisk_up()
 
 
@@ -495,14 +515,23 @@ async def collect_taskprocessors() -> None:
                 stripped = line.strip()
                 if not stripped or stripped.lower().startswith("processor "):
                     continue
-                match = TASKPROCESSOR_REGEX.search(stripped)
-                if not match:
+                parsed = _parse_taskprocessor_line(stripped)
+                if parsed is None:
+                    match = TASKPROCESSOR_REGEX.search(stripped)
+                    if not match:
+                        continue
+                    name = match.group("name")
+                    processed = int(match.group("processed"))
+                    inqueue = int(match.group("inqueue"))
+                    maxdepth = int(match.group("maxdepth"))
+                else:
+                    name, processed, inqueue, maxdepth = parsed
+                if name.lower() == "output:":
                     continue
-                name = match.group("name")
                 seen.add(name)
-                taskprocessor_queue_depth.labels(name=name).set(int(match.group("inqueue")))
-                taskprocessor_processed.labels(name=name).set(int(match.group("processed")))
-                taskprocessor_high_water.labels(name=name).set(int(match.group("maxdepth")))
+                taskprocessor_queue_depth.labels(name=name).set(inqueue)
+                taskprocessor_processed.labels(name=name).set(processed)
+                taskprocessor_high_water.labels(name=name).set(maxdepth)
         except Exception as exc:
             if (ENABLE_CLI and not FORCE_AMI_COMMAND) or CLI_REQUIRED:
                 logger.exception("taskprocessor collector error")
