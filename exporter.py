@@ -332,8 +332,9 @@ def _extract_ami_command_output(response) -> str:
         # Some AMI transports return each line prefixed with "Output: ".
         lines = []
         for raw_line in text.splitlines():
-            if raw_line.startswith("Output:"):
-                lines.append(raw_line.split(":", 1)[1].lstrip())
+            normalized = raw_line.lstrip()
+            if normalized.startswith("Output:"):
+                lines.append(normalized.split(":", 1)[1].lstrip())
             else:
                 lines.append(raw_line)
         return "\n".join(lines)
@@ -369,8 +370,8 @@ def _extract_output_lines_from_text(text: str) -> str:
     lines = []
     for raw in text.splitlines():
         line = raw.strip("\r")
-        if line.startswith("Output:"):
-            lines.append(line.split(":", 1)[1].lstrip())
+        if line.lstrip().startswith("Output:"):
+            lines.append(line.lstrip().split(":", 1)[1].lstrip())
     return "\n".join(lines).strip()
 
 
@@ -435,15 +436,15 @@ async def run_asterisk_command(command: str) -> str:
     if not output:
         output = _extract_ami_command_output(response)
     if not output:
-        # Fallback for AMI clients returning full text transcript
-        # instead of structured Output fields.
-        # Last chance: parse as AMI key-value event blocks and collect Output keys.
+        # Last chance: parse as AMI key-value event blocks and collect
+        # every key named "output" in case-insensitive form.
         parsed_chunks = []
         for event in _iter_ami_events(response):
-            if "Output" in event:
-                parsed_chunks.append(_extract_output_lines_from_text(f"Output: {event.get('Output', '')}"))
-            elif "output" in event:
-                parsed_chunks.append(_extract_output_lines_from_text(f"Output: {event.get('output', '')}"))
+            if not isinstance(event, dict):
+                continue
+            for key, value in event.items():
+                if str(key).lower() == "output" and value is not None:
+                    parsed_chunks.append(_extract_output_lines_from_text(f"Output: {value}"))
         output = "\n".join(parsed_chunks).strip()
     if not output:
         raise RuntimeError(f"empty AMI Command output for: {command}")
@@ -455,7 +456,7 @@ async def collect_pjsip_via_ami_actions() -> tuple[bool, int, int]:
     seen = 0
     rtt_seen = 0
     for event in _iter_ami_events(response):
-        if str(event.get("Event", "")).lower() != "endpointlist":
+        if str(event.get("Event") or event.get("event") or "").lower() != "endpointlist":
             continue
         endpoint = event.get("ObjectName") or event.get("EndpointName")
         if not endpoint:
@@ -473,7 +474,7 @@ async def collect_pjsip_via_ami_actions() -> tuple[bool, int, int]:
     reg_resp = await manager.send_action({"Action": "PJSIPShowRegistrationsOutbound"})
     reg_seen = 0
     for event in _iter_ami_events(reg_resp):
-        ev = str(event.get("Event", "")).lower()
+        ev = str(event.get("Event") or event.get("event") or "").lower()
         if ev not in {"outboundregistrationdetail", "outboundregistrationdetailcomplete"}:
             if "registration" not in ev:
                 continue
@@ -724,7 +725,7 @@ async def collect_queues() -> None:
             member_counts: Dict[str, int] = {}
             snapshot_totals: Dict[str, Dict[str, float]] = {}
             for event in _iter_ami_events(queue_resp):
-                ev = str(event.get("Event", "")).lower()
+                ev = str(event.get("Event") or event.get("event") or "").lower()
                 if ev == "queuemember":
                     q = event.get("Queue")
                     if q:
