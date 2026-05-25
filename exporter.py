@@ -377,6 +377,11 @@ def _extract_output_lines_from_text(text: str) -> str:
 def _iter_ami_events(response):
     if response is None:
         return
+    if hasattr(response, "events") and isinstance(getattr(response, "events"), list):
+        for item in getattr(response, "events"):
+            if isinstance(item, dict):
+                yield item
+        return
     if isinstance(response, str):
         # Fallback parser for plain-text AMI dumps split by blank lines.
         block: Dict[str, str] = {}
@@ -424,12 +429,14 @@ async def run_asterisk_command(command: str) -> str:
         raise RuntimeError("Both CLI and AMI command modes are disabled")
 
     response = await manager.send_action({"Action": "Command", "Command": command})
-    output = _extract_ami_command_output(response)
+    # Prefer explicit "Output:" lines from raw transcript first; this is the
+    # most stable representation across AMI client response shapes.
+    output = _extract_output_lines_from_text(str(response))
+    if not output:
+        output = _extract_ami_command_output(response)
     if not output:
         # Fallback for AMI clients returning full text transcript
         # instead of structured Output fields.
-        output = _extract_output_lines_from_text(str(response))
-    if not output:
         # Last chance: parse as AMI key-value event blocks and collect Output keys.
         parsed_chunks = []
         for event in _iter_ami_events(response):
