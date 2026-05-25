@@ -7,6 +7,7 @@ import signal
 import time
 from asyncio.subprocess import PIPE
 from contextlib import suppress
+from collections.abc import Mapping
 from typing import Dict, Set
 
 from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
@@ -348,8 +349,9 @@ async def _run_local_or_docker_cli(command: str) -> str:
 
 def _extract_ami_command_output(response) -> str:
     def _clean_output_line(value) -> str:
+        if isinstance(value, (list, tuple)):
+            return "\n".join(_clean_output_line(item) for item in value if item is not None)
         text = str(value)
-        # Some AMI transports return each line prefixed with "Output: ".
         lines = []
         for raw_line in text.splitlines():
             normalized = raw_line.lstrip()
@@ -361,29 +363,31 @@ def _extract_ami_command_output(response) -> str:
 
     if response is None:
         return ""
-    if isinstance(response, dict):
-        chunks = []
-        if "Output" in response and response["Output"] is not None:
-            chunks.append(_clean_output_line(response["Output"]))
-        if "output" in response and response["output"] is not None:
-            chunks.append(_clean_output_line(response["output"]))
-        if "data" in response and response["data"] is not None:
-            chunks.append(_clean_output_line(response["data"]))
-        return "\n".join(chunks).strip()
-    if isinstance(response, (list, tuple)):
-        chunks = []
+
+    chunks = []
+    if isinstance(response, Mapping):
+        for key, value in response.items():
+            key_l = str(key).lower()
+            if key_l in {"output", "data"} and value is not None:
+                chunks.append(_clean_output_line(value))
+    elif isinstance(response, (list, tuple)):
         for item in response:
-            if isinstance(item, dict):
-                out = item.get("Output")
-                if out is not None:
-                    chunks.append(_clean_output_line(out))
-                low_out = item.get("output")
-                if low_out is not None:
-                    chunks.append(_clean_output_line(low_out))
+            if isinstance(item, Mapping):
+                for key, value in item.items():
+                    if str(key).lower() in {"output", "data"} and value is not None:
+                        chunks.append(_clean_output_line(value))
             elif item is not None:
                 chunks.append(_clean_output_line(item))
-        return "\n".join(chunks).strip()
-    return _clean_output_line(response).strip()
+    else:
+        for attr in ("Output", "output", "data"):
+            with suppress(Exception):
+                value = getattr(response, attr)
+                if value is not None:
+                    chunks.append(_clean_output_line(value))
+        if not chunks:
+            chunks.append(_clean_output_line(response))
+
+    return "\n".join(chunk for chunk in chunks if chunk).strip()
 
 
 def _extract_output_lines_from_text(text: str) -> str:
