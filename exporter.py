@@ -157,7 +157,8 @@ QUEUE_REGEX = re.compile(
 )
 QUEUE_CALLS_FALLBACK_REGEX = re.compile(r"^(?P<queue>\S+)\s+has\s+(?P<calls>\d+)\s+calls", re.IGNORECASE)
 MEMBER_REGEX = re.compile(r"Members:\s+(?P<count>\d+)", re.IGNORECASE)
-HOLDTIME_REGEX = re.compile(r"holdtime\s+(?P<holdtime>\d+)", re.IGNORECASE)
+HOLDTIME_REGEX = re.compile(r"(?:(?P<seconds1>\d+)s\s+holdtime|holdtime\s+(?P<seconds2>\d+))", re.IGNORECASE)
+QUEUE_MEMBER_LINE_REGEX = re.compile(r"^\s+\S+.*\((?:PJSIP|SIP|Local|IAX2)/", re.IGNORECASE)
 QUEUE_COMPLETED_REGEX = re.compile(r"\bC:(?P<completed>\d+)\b")
 QUEUE_ABANDONED_REGEX = re.compile(r"\bA:(?P<abandoned>\d+)\b")
 
@@ -433,9 +434,9 @@ async def run_asterisk_command(command: str) -> str:
         parsed_chunks = []
         for event in _iter_ami_events(response):
             if "Output" in event:
-                parsed_chunks.append(str(event.get("Output", "")))
+                parsed_chunks.append(_extract_output_lines_from_text(f"Output: {event.get('Output', '')}"))
             elif "output" in event:
-                parsed_chunks.append(str(event.get("output", "")))
+                parsed_chunks.append(_extract_output_lines_from_text(f"Output: {event.get('output', '')}"))
         output = "\n".join(parsed_chunks).strip()
     if not output:
         raise RuntimeError(f"empty AMI Command output for: {command}")
@@ -773,7 +774,8 @@ async def collect_queues() -> None:
                     current_members = 0
                     holdtime_match = HOLDTIME_REGEX.search(line)
                     if holdtime_match:
-                        queue_holdtime.labels(queue=current_queue).set(int(holdtime_match.group("holdtime")))
+                        hold = holdtime_match.group("seconds1") or holdtime_match.group("seconds2")
+                        queue_holdtime.labels(queue=current_queue).set(int(hold))
                     continue
                 queue_calls_fallback_match = QUEUE_CALLS_FALLBACK_REGEX.search(line)
                 if queue_calls_fallback_match:
@@ -790,8 +792,9 @@ async def collect_queues() -> None:
 
                 holdtime_match = HOLDTIME_REGEX.search(line)
                 if holdtime_match and current_queue:
-                    queue_holdtime.labels(queue=current_queue).set(int(holdtime_match.group("holdtime")))
-                if current_queue and line.startswith("   ") and "(" in line and ")" in line:
+                    hold = holdtime_match.group("seconds1") or holdtime_match.group("seconds2")
+                    queue_holdtime.labels(queue=current_queue).set(int(hold))
+                if current_queue and QUEUE_MEMBER_LINE_REGEX.search(line):
                     current_members += 1
                     queue_agents.labels(queue=current_queue).set(current_members)
         except Exception as exc:
