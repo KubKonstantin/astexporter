@@ -96,14 +96,10 @@ queue_abandoned = Counter(
     "asterisk_queue_abandoned_total", "Abandoned queue calls", ["queue"], registry=registry
 )
 
-taskprocessor_queue_depth = Gauge(
-    "asterisk_taskprocessor_queue_depth", "Taskprocessor queue depth", ["name"], registry=registry
-)
-taskprocessor_processed = Gauge(
-    "asterisk_taskprocessor_processed_total", "Taskprocessor processed", ["name"], registry=registry
-)
-taskprocessor_high_water = Gauge(
-    "asterisk_taskprocessor_high_water", "Taskprocessor high water", ["name"], registry=registry
+taskprocessor_depth = Gauge(
+    "asterisk_taskprocessor_depth",
+    "Highest current queue depth across all Asterisk taskprocessors",
+    registry=registry,
 )
 
 calls_answered_total = Counter("asterisk_calls_answered_total", "Answered calls", registry=registry)
@@ -514,7 +510,8 @@ async def collect_taskprocessors() -> None:
     while True:
         try:
             output = await run_asterisk_command("core show taskprocessors")
-            seen: Set[str] = set()
+            highest_current_depth = 0
+            taskprocessors_seen = 0
             for line in output.splitlines():
                 stripped = line.strip()
                 if not stripped or stripped.lower().startswith("processor "):
@@ -525,17 +522,20 @@ async def collect_taskprocessors() -> None:
                     if not match:
                         continue
                     name = match.group("name")
-                    processed = int(match.group("processed"))
+                    _processed = int(match.group("processed"))
                     inqueue = int(match.group("inqueue"))
-                    maxdepth = int(match.group("maxdepth"))
+                    _maxdepth = int(match.group("maxdepth"))
                 else:
-                    name, processed, inqueue, maxdepth = parsed
+                    name, _processed, inqueue, _maxdepth = parsed
                 if name.lower() == "output:":
                     continue
-                seen.add(name)
-                taskprocessor_queue_depth.labels(name=name).set(inqueue)
-                taskprocessor_processed.labels(name=name).set(processed)
-                taskprocessor_high_water.labels(name=name).set(maxdepth)
+                taskprocessors_seen += 1
+                highest_current_depth = max(highest_current_depth, inqueue)
+
+            if taskprocessors_seen:
+                taskprocessor_depth.set(highest_current_depth)
+            else:
+                logger.warning("no taskprocessors parsed from AMI Command output")
         except Exception as exc:
             if (ENABLE_CLI and not FORCE_AMI_COMMAND) or CLI_REQUIRED:
                 logger.exception("taskprocessor collector error")
