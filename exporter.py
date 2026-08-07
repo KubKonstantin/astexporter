@@ -188,7 +188,9 @@ def update_asterisk_up() -> None:
 
 
 def _pjsip_status_to_value(status: str) -> int:
-    st = status.lower()
+    st = str(status).strip().lower()
+    if st.startswith(("ok (", "lagged (")):
+        return 1
     if st in {"avail", "available", "ok", "reachable", "lagged", "in use", "not in use"}:
         return 1
     return 0
@@ -789,7 +791,8 @@ async def on_queue_leave(_manager, event):
     queue = event.get("Queue")
     if not queue:
         return
-    queue_stats_cache[queue] = max(0, queue_stats_cache.get(queue, 0) - 1)
+    queue_stats_cache[queue] = max(0, queue_stats_cache.get(queue, 0) - 1
+    )
     queue_calls.labels(queue=queue).set(queue_stats_cache[queue])
     queue_completed.labels(queue=queue).inc()
 
