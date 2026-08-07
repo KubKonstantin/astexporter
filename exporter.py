@@ -48,6 +48,9 @@ CLI_DOCKER_SOCKET = os.getenv("CLI_DOCKER_SOCKET", "/var/run/docker.sock")
 CLI_DOCKER_CONTAINER = os.getenv("CLI_DOCKER_CONTAINER", "voip-asterisk")
 COMMAND_TIMEOUT = float(os.getenv("COMMAND_TIMEOUT", "8"))
 CLI_REQUIRED = os.getenv("CLI_REQUIRED", "false").lower() == "true"
+SIP_DRIVER = os.getenv("sipdriver", os.getenv("SIPDRIVER", "pjsip")).strip().lower()
+if SIP_DRIVER not in {"pjsip", "chan_sip"}:
+    raise ValueError("sipdriver must be either 'pjsip' or 'chan_sip'")
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -71,14 +74,21 @@ asterisk_active_channels = Gauge(
 )
 asterisk_active_calls = Gauge("asterisk_active_calls", "Active calls", registry=registry)
 
+sip_metric_prefix = "pjsip" if SIP_DRIVER == "pjsip" else "chan_sip"
 pjsip_endpoint_status = Gauge(
-    "asterisk_pjsip_endpoint_status", "Endpoint status", ["endpoint"], registry=registry
+    f"asterisk_{sip_metric_prefix}_endpoint_status",
+    "Endpoint status",
+    ["endpoint"],
+    registry=registry,
 )
 pjsip_endpoint_rtt = Gauge(
-    "asterisk_pjsip_endpoint_rtt_ms", "Endpoint RTT ms", ["endpoint"], registry=registry
+    f"asterisk_{sip_metric_prefix}_endpoint_rtt_ms",
+    "Endpoint RTT ms",
+    ["endpoint"],
+    registry=registry,
 )
 pjsip_registration_status = Gauge(
-    "asterisk_pjsip_registration_status",
+    f"asterisk_{sip_metric_prefix}_registration_status",
     "Registration status",
     ["registration"],
     registry=registry,
@@ -148,6 +158,17 @@ REGISTRATION_ANY_REGEX = re.compile(
 )
 OUTBOUND_REG_REGEX = re.compile(r"Outbound Registration:\s*(?P<name>\S+)", re.IGNORECASE)
 REG_STATUS_REGEX = re.compile(r"\b(?:Status|State)\s*:\s*(?P<state>.+)$", re.IGNORECASE)
+CHAN_SIP_PEER_REGEX = re.compile(
+    r"^(?P<endpoint>[^\s/]+)(?:/\S+)?\s+.*?\s(?P<status>OK\s*\([\d.]+\s*ms\)|"
+    r"LAGGED\s*\([\d.]+\s*ms\)|UNKNOWN|UNREACHABLE|Unmonitored)(?:\s|$)",
+    re.IGNORECASE,
+)
+CHAN_SIP_RTT_REGEX = re.compile(r"\((?P<rtt>[\d.]+)\s*ms\)", re.IGNORECASE)
+CHAN_SIP_REGISTRATION_REGEX = re.compile(
+    r"^(?P<host>\S+)\s+\S+\s+(?P<username>\S+)\s+\d+\s+"
+    r"(?P<state>Registered|Rejected|Unregistered|Request Sent|Failed|Timeout)\b",
+    re.IGNORECASE,
+)
 QUEUE_REGEX = re.compile(
     r"^(?P<queue>\S+)\s+has\s+(?P<calls>\d+)\s+calls.*?(?P<agents>\d+)\s+members?",
     re.IGNORECASE,
@@ -579,6 +600,11 @@ async def collect_core() -> None:
 async def collect_pjsip() -> None:
     while True:
         try:
+            if SIP_DRIVER == "chan_sip":
+                await collect_chan_sip_once()
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
             # Use "Action: Command" output path for endpoints/registrations parsing
             # so behavior matches CLI table parsing semantics.
             output = await run_asterisk_command("pjsip show endpoints")
@@ -655,6 +681,31 @@ async def collect_pjsip() -> None:
             else:
                 logger.debug("pjsip collector skipped: %s", exc)
         await asyncio.sleep(POLL_INTERVAL)
+
+
+async def collect_chan_sip_once() -> None:
+    """Collect the chan_sip equivalents of endpoint and registration metrics."""
+    output = _normalize_command_output(await run_asterisk_command("sip show peers"))
+    for line in output.splitlines():
+        match = CHAN_SIP_PEER_REGEX.search(line.strip())
+        if not match:
+            continue
+        endpoint = match.group("endpoint")
+        status = match.group("status")
+        pjsip_endpoint_status.labels(endpoint=endpoint).set(_pjsip_status_to_value(status))
+        rtt_match = CHAN_SIP_RTT_REGEX.search(status)
+        if rtt_match:
+            pjsip_endpoint_rtt.labels(endpoint=endpoint).set(float(rtt_match.group("rtt")))
+
+    registrations = _normalize_command_output(await run_asterisk_command("sip show registry"))
+    for line in registrations.splitlines():
+        match = CHAN_SIP_REGISTRATION_REGEX.search(line.strip())
+        if not match:
+            continue
+        registration = match.group("username") or match.group("host")
+        pjsip_registration_status.labels(registration=registration).set(
+            1 if match.group("state").lower() == "registered" else 0
+        )
 
 
 manager = Manager(host=AMI_HOST, port=AMI_PORT, username=AMI_USER, secret=AMI_SECRET)
@@ -880,6 +931,7 @@ async def main() -> None:
         logger.info("Command collectors use CLI transport when enabled.")
     if not ENABLE_CLI:
         logger.info("CLI disabled. Collecting command-based metrics via AMI Action: Command.")
+    logger.info("SIP metrics use the %s driver", SIP_DRIVER)
     if ENABLE_CLI and shutil.which(ASTERISK_BIN) is None:
         logger.warning("Starting without CLI collectors: ASTERISK_BIN=%s not found", ASTERISK_BIN)
     logger.info("Exporter started on %s:%s", EXPORTER_HOST, EXPORTER_PORT)
